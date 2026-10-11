@@ -38,6 +38,38 @@ const MAX_BODY: usize = 10_000;
 // TAG TAXONOMY
 // ═══════════════════════════════════════════════════════
 
+fn classify_epitope(text: &str) -> String {
+    static KEYWORDS: &[(&str, &str)] = &[
+        ("anderson","PHYSICS"),("localization","PHYSICS"),("permeability","PHYSICS"),
+        ("lattice","PHYSICS"),("qcd","PHYSICS"),("hofstadter","PHYSICS"),("quantum","PHYSICS"),
+        ("spectral","PHYSICS"),("negentropy","PHYSICS"),
+        ("graph","TOPOLOGY"),("topology","TOPOLOGY"),("network","TOPOLOGY"),("mesh","TOPOLOGY"),
+        ("braid","TOPOLOGY"),("fractal","TOPOLOGY"),
+        ("philosophy","PHILOSOPHY"),("omelas","PHILOSOPHY"),("atlas","PHILOSOPHY"),
+        ("sovereignty","PHILOSOPHY"),("commons","PHILOSOPHY"),("bibliography","PHILOSOPHY"),
+        ("methodology","METHOD"),("constrained","METHOD"),("evolution","METHOD"),
+        ("guidestone","METHOD"),("tufte","METHOD"),("schell","METHOD"),("ludo","METHOD"),
+        ("detroit","INVESTIGATION"),("tuebor","INVESTIGATION"),("public-record","INVESTIGATION"),
+        ("charter","INVESTIGATION"),("institutional","INVESTIGATION"),("gorilla","INVESTIGATION"),
+        ("membrane","IMMUNE"),("immune","IMMUNE"),("skunkbat","IMMUNE"),("scatter","IMMUNE"),
+        ("antidote","IMMUNE"),("non-newtonian","IMMUNE"),
+        ("science","SCIENCE"),("biology","SCIENCE"),("genomics","SCIENCE"),("ferment","SCIENCE"),
+        ("signal","SIGNAL"),("lossy","SIGNAL"),("shannon","SIGNAL"),("channel","SIGNAL"),
+        ("story","SIGNAL"),("billboard","SIGNAL"),("beacon","SIGNAL"),("transit","SIGNAL"),
+    ];
+    let lower = text.to_lowercase();
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for (kw, cat) in KEYWORDS {
+        if lower.contains(kw) {
+            *counts.entry(cat).or_insert(0) += 1;
+        }
+    }
+    counts.into_iter()
+        .max_by_key(|&(_, n)| n)
+        .map(|(cat, _)| cat.to_string())
+        .unwrap_or_else(|| "SIGNAL".to_string())
+}
+
 fn valid_tags() -> HashMap<&'static str, &'static str> {
     HashMap::from([
         ("witness", "I have direct knowledge of events described"),
@@ -65,6 +97,8 @@ struct Signal {
     body: String,
     contact: Option<String>,
     status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    epitope: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -223,6 +257,7 @@ async fn handle_opsonize(
                 ));
             }
 
+            let epitope = classify_epitope(&format!("{} {} {}", page, tag, body_text));
             let signal = Signal {
                 ts: chrono::Utc::now().to_rfc3339(),
                 epoch: epoch_secs() as f64,
@@ -232,6 +267,7 @@ async fn handle_opsonize(
                 body: body_text,
                 contact,
                 status: "pending".into(),
+                epitope: Some(epitope),
             };
 
             std::fs::create_dir_all(DATA_DIR).ok();
