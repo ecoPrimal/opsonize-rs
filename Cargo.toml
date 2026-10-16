@@ -1,12 +1,12 @@
 [package]
 name = "opsonize"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2021"
-description = "Immune tagging + visitor traces — replaces Python opsonize/svc.py + traces_svc.py"
+description = "Immune tagging + visitor traces + discussion relay + membrane analysis chain"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-hyper = { version = "1", features = ["server", "http1"] }
+hyper = { version = "1", features = ["server", "client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 serde = { version = "1", features = ["derive"] }
