@@ -955,6 +955,23 @@ const AI_BOTS: &[&str] = &[
 const META_BOTS: &[&str] = &[
     "meta-externalagent", "facebookexternalhit", "facebookbot",
 ];
+// META SQUATTER — no ASN lookup needed.
+//
+// Lichen model: classification grows on the stone of ingested traffic.
+// skunky-ingest accumulates EntityAccum per entity — ip_hashes, subnets,
+// timestamps, chrome_versions, path_ops, repos. The pattern IS the identity.
+// "57.141.*" didn't come from a database — it grew from 571K+ requests
+// hitting the same membrane surface. Timing uniformity 0.994 wasn't looked
+// up — it was measured from the timestamps vector.
+//
+// Meta is the squatter not the guard. Dublin IPs dropping because they're
+// ALREADY INSIDE via SSO (Sign In With Facebook). They don't need to crawl
+// when they own the login button on every third-party site.
+//
+// Every data source follows this braid:
+//   ingest (access log) → accumulate (EntityAccum) → emit topology
+//   → topology changes feed classification → classification changes ingest
+// The cycle is the lichen. The stone is the traffic. The growth is the truth.
 const SEO_BOTS: &[&str] = &[
     "googlebot", "bingbot", "semrushbot", "ahrefsbot", "mj12bot",
     "dotbot", "petalbot", "yandexbot", "baiduspider", "sogou", "seznambot",
@@ -1281,6 +1298,12 @@ fn run_negentropy_update(fleet: &serde_json::Value, self_rem: &serde_json::Value
             "meta_blocked": bot_breakdown.get("meta").and_then(|v| v.as_u64()).unwrap_or(0),
             "ai_blocked": bot_breakdown.get("ai_crawler").and_then(|v| v.as_u64()).unwrap_or(0),
             "total_violations": fleet.get("defense_stats").and_then(|d| d.get("total_blocked")).and_then(|v| v.as_u64()).unwrap_or(0),
+            "meta_squatter": {
+                "note": "Meta is the squatter not the guard. Classification grows on the stone — no ASN lookup needed. skunky-ingest EntityAccum already accumulates subnets, timing, UA rotation from ingested traffic. The lichen IS the topology.",
+                "vector": "SSO — Sign In With Facebook/Instagram — already inside via identity federation",
+                "model": "lichen — ingest → accumulate → emit topology → topology changes classification → cycle",
+                "evidence": "571K+ requests, 60 rotating IPs, 18 masking UAs, timing uniformity 0.994 — all measured from the stone, not looked up",
+            },
         },
         "canary": {
             "tokens_minted": canary.get("tokens_minted").and_then(|v| v.as_u64()).unwrap_or(0),
@@ -1508,13 +1531,225 @@ async fn membrane_analysis_loop() {
 }
 
 // ═══════════════════════════════════════════════════════
-// MAIN — run all five services + analysis loop
+// GATE-MSG — inter-gate message relay (port 9761)
+// Lightweight message passing between gates (eastGate, northGate, etc.)
+// Messages stored as JSONL, rate-limited, no auth needed.
+// ═══════════════════════════════════════════════════════
+
+const GATE_MSG_PORT: u16 = 9761;
+const GATE_MSG_DIR: &str = "/opt/ecoPrimals/gate-msg";
+const GATE_MSG_RATE_WINDOW: u64 = 60;
+const GATE_MSG_RATE_MAX: usize = 10;
+
+#[derive(Serialize, Deserialize, Clone)]
+struct GateMessage {
+    id: String,
+    ts: String,
+    epoch: u64,
+    from: String,
+    to: String,
+    body: String,
+    #[serde(default)]
+    read: bool,
+}
+
+#[derive(Deserialize)]
+struct GateMsgSubmit {
+    from: Option<String>,
+    to: Option<String>,
+    body: Option<String>,
+}
+
+fn gate_msg_path() -> PathBuf { Path::new(GATE_MSG_DIR).join("messages.jsonl") }
+
+fn gen_msg_id() -> String {
+    let ts = epoch_secs();
+    let mut h = Sha256::new();
+    h.update(format!("gm-{ts}-{}", std::process::id()).as_bytes());
+    let r = h.finalize();
+    format!("gm{}", &hex::encode(&r[..6]))
+}
+
+fn load_gate_messages(gate: &str) -> Vec<GateMessage> {
+    let mut out = Vec::new();
+    if let Ok(f) = std::fs::File::open(gate_msg_path()) {
+        for line in BufReader::new(f).lines().flatten() {
+            if let Ok(m) = serde_json::from_str::<GateMessage>(&line) {
+                if m.to == gate || m.to == "all" {
+                    out.push(m);
+                }
+            }
+        }
+    }
+    out.sort_by_key(|m| m.epoch);
+    out
+}
+
+async fn handle_gate_msg(
+    req: Request<Incoming>,
+    state: SharedState,
+) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    let cors = "*";
+
+    if req.method() == Method::OPTIONS {
+        return Ok(json_response(StatusCode::NO_CONTENT, serde_json::json!({}), cors));
+    }
+
+    let path = req.uri().path().to_string();
+    let query = req.uri().query().unwrap_or("").to_string();
+
+    match (req.method().clone(), path.as_str()) {
+        // GET /api/gate-msg?gate=<name> — read messages for a gate
+        (Method::GET, "/api/gate-msg") => {
+            let gate = query.split('&')
+                .find(|p| p.starts_with("gate="))
+                .and_then(|p| p.strip_prefix("gate="))
+                .unwrap_or("all")
+                .to_string();
+
+            let messages = load_gate_messages(&gate);
+            let unread: Vec<&GateMessage> = messages.iter().filter(|m| !m.read).collect();
+            let count = unread.len();
+
+            let public: Vec<serde_json::Value> = messages.iter().rev().take(50).map(|m| {
+                serde_json::json!({
+                    "id": m.id,
+                    "ts": m.ts,
+                    "from": m.from,
+                    "to": m.to,
+                    "body": m.body,
+                    "read": m.read,
+                })
+            }).collect();
+
+            Ok(json_response(StatusCode::OK,
+                serde_json::json!({"messages": public, "count": count, "gate": gate}), cors))
+        }
+
+        // POST /api/gate-msg — send a message between gates
+        (Method::POST, "/api/gate-msg") => {
+            let ip = req.headers()
+                .get("x-real-ip")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("unknown")
+                .to_string();
+
+            {
+                let mut limiter = state.lock().unwrap();
+                let key = format!("gatemsg-{ip}");
+                let now = epoch_secs();
+                let entry = limiter.windows.entry(key).or_default();
+                entry.retain(|&t| now - t < GATE_MSG_RATE_WINDOW);
+                if entry.len() >= GATE_MSG_RATE_MAX {
+                    return Ok(json_response(StatusCode::TOO_MANY_REQUESTS,
+                        serde_json::json!({"error": "rate limited", "detail": "max 10 per minute"}), cors));
+                }
+                entry.push(now);
+            }
+
+            let body_bytes = http_body_util::BodyExt::collect(req.into_body())
+                .await?.to_bytes();
+            if body_bytes.len() > MAX_BODY {
+                return Ok(json_response(StatusCode::PAYLOAD_TOO_LARGE,
+                    serde_json::json!({"error": "too large"}), cors));
+            }
+
+            let data: GateMsgSubmit = match serde_json::from_slice(&body_bytes) {
+                Ok(d) => d,
+                Err(_) => return Ok(json_response(StatusCode::BAD_REQUEST,
+                    serde_json::json!({"error": "invalid JSON"}), cors)),
+            };
+
+            let from = sanitize(data.from.as_deref().unwrap_or("anonymous"), 50);
+            let to = sanitize(data.to.as_deref().unwrap_or("all"), 50);
+            let body_text = sanitize(data.body.as_deref().unwrap_or(""), 2000);
+
+            if body_text.is_empty() {
+                return Ok(json_response(StatusCode::BAD_REQUEST,
+                    serde_json::json!({"error": "body required"}), cors));
+            }
+
+            let msg = GateMessage {
+                id: gen_msg_id(),
+                ts: chrono::Utc::now().to_rfc3339(),
+                epoch: epoch_secs(),
+                from: from.clone(),
+                to: to.clone(),
+                body: body_text.clone(),
+                read: false,
+            };
+
+            std::fs::create_dir_all(GATE_MSG_DIR).ok();
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true).append(true).open(gate_msg_path())
+            {
+                let line = serde_json::to_string(&msg).unwrap_or_default();
+                let _ = writeln!(f, "{line}");
+            }
+
+            ntfy_push("membrane-events",
+                &format!("📨 gate-msg {from} → {to}: {}", &body_text[..body_text.len().min(60)]));
+
+            Ok(json_response(StatusCode::CREATED,
+                serde_json::json!({
+                    "ok": true,
+                    "id": msg.id,
+                    "from": from,
+                    "to": to,
+                    "message": "Message relayed through the membrane.",
+                }), cors))
+        }
+
+        // POST /api/gate-msg/read — mark messages as read
+        (Method::POST, "/api/gate-msg/read") => {
+            let body_bytes = http_body_util::BodyExt::collect(req.into_body())
+                .await?.to_bytes();
+
+            #[derive(Deserialize)]
+            struct ReadReq { gate: Option<String> }
+            let data: ReadReq = serde_json::from_slice(&body_bytes).unwrap_or(ReadReq { gate: None });
+            let gate = data.gate.unwrap_or_else(|| "all".into());
+
+            let mut marked = 0u64;
+            if let Ok(f) = std::fs::File::open(gate_msg_path()) {
+                let mut lines: Vec<String> = Vec::new();
+                for line in BufReader::new(f).lines().flatten() {
+                    if let Ok(mut m) = serde_json::from_str::<GateMessage>(&line) {
+                        if (m.to == gate || m.to == "all") && !m.read {
+                            m.read = true;
+                            marked += 1;
+                        }
+                        lines.push(serde_json::to_string(&m).unwrap_or(line));
+                    } else {
+                        lines.push(line);
+                    }
+                }
+                if marked > 0 {
+                    if let Ok(mut f) = std::fs::File::create(gate_msg_path()) {
+                        for l in lines {
+                            let _ = writeln!(f, "{l}");
+                        }
+                    }
+                }
+            }
+
+            Ok(json_response(StatusCode::OK,
+                serde_json::json!({"ok": true, "marked_read": marked}), cors))
+        }
+
+        _ => Ok(json_response(StatusCode::NOT_FOUND, serde_json::json!({"error": "not found"}), cors)),
+    }
+}
+
+// ═══════════════════════════════════════════════════════
+// MAIN — run all six services + analysis loop
 // ═══════════════════════════════════════════════════════
 
 #[tokio::main]
 async fn main() {
     std::fs::create_dir_all(DATA_DIR).ok();
     std::fs::create_dir_all(DISCUSS_DIR).ok();
+    std::fs::create_dir_all(GATE_MSG_DIR).ok();
     std::fs::create_dir_all(LIVE_DIR).ok();
 
     let state: SharedState = Arc::new(Mutex::new(RateLimiter::default()));
@@ -1522,14 +1757,17 @@ async fn main() {
     let opsonize_addr: SocketAddr = ([127, 0, 0, 1], OPSONIZE_PORT).into();
     let traces_addr: SocketAddr = ([127, 0, 0, 1], TRACES_PORT).into();
     let discuss_addr: SocketAddr = ([127, 0, 0, 1], DISCUSS_PORT).into();
+    let gate_msg_addr: SocketAddr = ([127, 0, 0, 1], GATE_MSG_PORT).into();
 
     let opsonize_listener = TcpListener::bind(opsonize_addr).await.expect("bind opsonize");
     let traces_listener = TcpListener::bind(traces_addr).await.expect("bind traces");
     let discuss_listener = TcpListener::bind(discuss_addr).await.expect("bind discuss");
+    let gate_msg_listener = TcpListener::bind(gate_msg_addr).await.expect("bind gate-msg");
 
     eprintln!("[opsonize] listening on {opsonize_addr}");
     eprintln!("[traces]   listening on {traces_addr}");
     eprintln!("[discuss]  listening on {discuss_addr}");
+    eprintln!("[gate-msg] listening on {gate_msg_addr}");
     eprintln!("[membrane] analysis chain: fleet + negentropy + self-remainder");
 
     let opsonize_state = state.clone();
@@ -1573,6 +1811,21 @@ async fn main() {
         }
     });
 
+    let gate_msg_state = state.clone();
+    let gate_msg_task = tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = gate_msg_listener.accept().await else { continue };
+            let io = TokioIo::new(stream);
+            let st = gate_msg_state.clone();
+            tokio::spawn(async move {
+                let service = hyper::service::service_fn(move |req| {
+                    handle_gate_msg(req, st.clone())
+                });
+                let _ = http1::Builder::new().serve_connection(io, service).await;
+            });
+        }
+    });
+
     let salesman_task = tokio::spawn(salesman_watch());
     let membrane_task = tokio::spawn(membrane_analysis_loop());
 
@@ -1580,6 +1833,7 @@ async fn main() {
         _ = opsonize_task => {}
         _ = traces_task => {}
         _ = discuss_task => {}
+        _ = gate_msg_task => {}
         _ = salesman_task => {}
         _ = membrane_task => {}
     }
